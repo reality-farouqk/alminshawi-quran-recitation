@@ -90,6 +90,10 @@ final class AudioPlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDeleg
     private var currentLocalURL: URL?
     private var pendingPlaybackRequestId: UUID? // Track the most recent playback request
     private let downloadedKey = "downloadedSurahs"
+    private let progressKey = "playbackProgress"
+    private let currentSurahKey = "currentSurahId"
+    private let isPlayingKey = "isPlayingState"
+    private var interruptionObserver: NSObjectProtocol?
 
     override init() {
         super.init()
@@ -107,6 +111,12 @@ final class AudioPlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDeleg
         if let saved = UserDefaults.standard.array(forKey: downloadedKey) as? [Int] {
             downloadedSurahs = Set(saved)
         }
+
+        // Setup background interruption handling
+        setupInterruptionHandling()
+
+        // Restore previous playback state
+        restorePlaybackState()
     }
 
     private func setupRemoteCommands() {
@@ -556,5 +566,123 @@ final class AudioPlayerViewModel: NSObject, ObservableObject, AVAudioPlayerDeleg
 
     private func persistDownloadedSurahs() {
         UserDefaults.standard.set(Array(downloadedSurahs), forKey: downloadedKey)
+    }
+
+    // MARK: - Progress Persistence & Interruption Handling
+
+    private func setupInterruptionHandling() {
+        interruptionObserver = NotificationCenter.default.addObserver(
+            forName: AVAudioSession.interruptionNotification,
+            object: AVAudioSession.sharedInstance(),
+            queue: .main
+        ) { [weak self] notification in
+            self?.handleAudioSessionInterruption(notification)
+        }
+
+        // Save progress when app goes to background
+        NotificationCenter.default.addObserver(
+            forName: UIApplication.willResignActiveNotification,
+            object: nil,
+            queue: .main
+        ) { [weak self] _ in
+            self?.savePlaybackState()
+        }
+    }
+
+    private func handleAudioSessionInterruption(_ notification: Notification) {
+        guard let userInfo = notification.userInfo,
+              let typeValue = userInfo[AVAudioSessionInterruptionTypeKey] as? UInt,
+              let type = AVAudioSession.InterruptionType(rawValue: typeValue) else {
+            return
+        }
+
+        switch type {
+        case .began:
+            // Audio session interrupted (phone call, etc.)
+            if isPlaying {
+                pause()
+                // Mark that we were interrupted so we can resume later
+                UserDefaults.standard.set(true, forKey: "wasInterrupted")
+            }
+        case .ended:
+            // Interruption ended
+            guard let optionsValue = userInfo[AVAudioSessionInterruptionOptionKey] as? UInt else { return }
+            let options = AVAudioSession.InterruptionOptions(rawValue: optionsValue)
+
+            if options.contains(.shouldResume) {
+                // Resume playback if we should
+                if UserDefaults.standard.bool(forKey: "wasInterrupted") {
+                    UserDefaults.standard.removeObject(forKey: "wasInterrupted")
+                    // Small delay to ensure audio session is ready
+                    DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) {
+                        self.play()
+                    }
+                }
+            }
+        @unknown default:
+            break
+        }
+    }
+
+    private func savePlaybackState() {
+        guard let surah = currentSurah else { return }
+
+        let state: [String: Any] = [
+            "surahId": surah.id,
+            "progress": progress,
+            "isPlaying": isPlaying,
+            "shuffle": shuffle,
+            "repeatMode": repeatMode.rawValue
+        ]
+
+        UserDefaults.standard.set(state, forKey: "playbackState")
+    }
+
+    private func restorePlaybackState() {
+        guard let state = UserDefaults.standard.dictionary(forKey: "playbackState"),
+              let surahId = state["surahId"] as? String,
+              let savedProgress = state["progress"] as? Double,
+              let savedIsPlaying = state["isPlaying"] as? Bool else {
+            return
+        }
+
+        // Find the surah in queue
+        if let surahIdInt = Int(surahId), let surah = queue.first(where: { $0.id == surahIdInt }) {
+            currentSurah = surah
+            progress = savedProgress
+
+            // Restore shuffle and repeat settings
+            if let savedShuffle = state["shuffle"] as? Bool {
+                shuffle = savedShuffle
+            }
+            if let savedRepeatRaw = state["repeatMode"] as? Int,
+               let savedRepeatMode = RepeatMode(rawValue: savedRepeatRaw) {
+                repeatMode = savedRepeatMode
+            }
+
+            // Load the audio file
+            let cache = AudioCache.shared
+            if cache.exists(surah.number) {
+                do {
+                    player = try AVAudioPlayer(contentsOf: cache.localURL(for: surah.number))
+                    player?.delegate = self
+                    player?.currentTime = savedProgress
+                    duration = player?.duration ?? 0
+
+                    if savedIsPlaying {
+                        // Don't auto-play on launch, just prepare
+                        player?.prepareToPlay()
+                        // User can tap play to resume
+                    }
+
+                    updateNowPlaying()
+                } catch {
+                    print("Failed to restore audio player: \(error)")
+                }
+            }
+        }
+
+        // Clear the saved state after restoring
+        UserDefaults.standard.removeObject(forKey: "playbackState")
     }
 }
